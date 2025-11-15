@@ -38,33 +38,15 @@
 #define MAX_SSID_LEN                    32
 #define MAX_PASSWORD_LEN                64
 
-/* WiFi network entry for temporary storage during scanning */
-struct wifi_network {
-    char ssid[MAX_SSID_LEN + 1];
-    int signal;
-    char security[16];
-};
-
-/**
- * Find existing network by SSID in the networks array
- * Returns index if found, -1 if not found
- */
-static int find_network_by_ssid(struct wifi_network *networks, int count, const char *ssid)
-{
-    int i;
-    for (i = 0; i < count; i++) {
-        if (strcmp(networks[i].ssid, ssid) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 /*******************************************************************************
  * Forward Declarations
  ******************************************************************************/
 
 static int write_file_string(const char *filename, const char *value);
+static void set_state(improv_state_t new_state);
+static void set_error(improv_error_t new_error);
+static void send_rpc_result(improv_command_t command, const char **strings, size_t string_count);
+static void wifi_check_timer_cb(struct ble_npl_event *ev);
 
 /*******************************************************************************
  * WiFi Provisioning Functions
@@ -72,166 +54,20 @@ static int write_file_string(const char *filename, const char *value);
 
 /* WiFi provisioning status */
 static uint8_t wifi_status = 0;  /* 0=idle, 1=connecting, 2=connected, 3=failed */
+static struct ble_npl_callout wifi_check_timer;
+static int wifi_check_attempts = 0;
+#define MAX_WIFI_CHECK_ATTEMPTS 30  /* 30 seconds total (30 x 1s) */
 
-/* Scan WiFi networks and return Improv-formatted results */
-char* scan_wifi_networks_improv(void)
-{
-    FILE *fp;
-    char line[512];
-    char *result = NULL;
-    size_t result_size = 4096;
-    size_t result_len = 0;
+/* Shutdown timer - used to gracefully shut down BLE after provisioning */
+static struct ble_npl_callout shutdown_timer;
+static void shutdown_timer_cb(struct ble_npl_event *ev);
 
-    /* Temporary storage for parsing */
-    char current_ssid[MAX_SSID_LEN + 1] = "";
-    int current_signal = -100;
-    char current_security[16] = "OPEN";
-    int has_rsn = 0, has_wpa = 0, has_wpa3 = 0, has_privacy = 0;
+/* BLE connection handle */
+static uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
-    /* Storage for unique networks */
-    struct wifi_network networks[50];
-    int network_count = 0;
-    int i, existing_idx;
-
-    /* Allocate buffer for result */
-    result = (char*)atbm_kmalloc(result_size, 0);
-    if (!result) {
-        iot_printf("[IMPROV-SCAN] Failed to allocate buffer\n");
-        return NULL;
-    }
-    result[0] = '\0';
-
-    /* Execute WiFi scan command */
-    fp = popen("iw dev wlan0 scan 2>/dev/null", "r");
-    if (!fp) {
-        iot_printf("[IMPROV-SCAN] Failed to execute iw scan command\n");
-        atbm_kfree(result);
-        return NULL;
-    }
-
-    iot_printf("[IMPROV-SCAN] Scanning WiFi networks...\n");
-
-    /* Parse scan output (same logic as scan_wifi_networks) */
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        if (strstr(line, "BSS ") == line) {
-            /* Process previous BSS if it has a valid SSID */
-            if (current_ssid[0] != '\0') {
-                /* Determine security type */
-                if (has_wpa3) {
-                    strcpy(current_security, "WPA3");
-                } else if (has_rsn) {
-                    strcpy(current_security, "WPA2");
-                } else if (has_wpa) {
-                    strcpy(current_security, "WPA");
-                } else if (has_privacy) {
-                    strcpy(current_security, "WEP");
-                } else {
-                    strcpy(current_security, "OPEN");
-                }
-
-                /* Check if we already have this SSID */
-                existing_idx = find_network_by_ssid(networks, network_count, current_ssid);
-
-                if (existing_idx >= 0) {
-                    /* Keep stronger signal */
-                    if (current_signal > networks[existing_idx].signal) {
-                        networks[existing_idx].signal = current_signal;
-                        strcpy(networks[existing_idx].security, current_security);
-                    }
-                } else if (network_count < 50) {
-                    /* New SSID - add it */
-                    strcpy(networks[network_count].ssid, current_ssid);
-                    networks[network_count].signal = current_signal;
-                    strcpy(networks[network_count].security, current_security);
-                    network_count++;
-                }
-            }
-
-            /* Reset for next BSS */
-            current_ssid[0] = '\0';
-            current_signal = -100;
-            has_rsn = 0;
-            has_wpa = 0;
-            has_wpa3 = 0;
-            has_privacy = 0;
-        }
-        else if (strstr(line, "SSID: ")) {
-            char *ssid_start = strstr(line, "SSID: ") + 6;
-            char *ssid_end = strchr(ssid_start, '\n');
-            if (ssid_end) *ssid_end = '\0';
-
-            while (*ssid_start == ' ' || *ssid_start == '\t') ssid_start++;
-
-            if (*ssid_start != '\0') {
-                strncpy(current_ssid, ssid_start, MAX_SSID_LEN);
-                current_ssid[MAX_SSID_LEN] = '\0';
-            }
-        }
-        else if (strstr(line, "signal:")) {
-            char *sig_start = strstr(line, "signal:") + 7;
-            current_signal = atoi(sig_start);
-        }
-        else if (strstr(line, "RSN:") || strstr(line, "WPA2")) {
-            has_rsn = 1;
-        }
-        else if (strstr(line, "WPA:")) {
-            has_wpa = 1;
-        }
-        else if (strstr(line, "WPA3")) {
-            has_wpa3 = 1;
-        }
-        else if (strstr(line, "Privacy:")) {
-            has_privacy = 1;
-        }
-    }
-
-    /* Process last BSS */
-    if (current_ssid[0] != '\0') {
-        if (has_wpa3) {
-            strcpy(current_security, "WPA3");
-        } else if (has_rsn) {
-            strcpy(current_security, "WPA2");
-        } else if (has_wpa) {
-            strcpy(current_security, "WPA");
-        } else if (has_privacy) {
-            strcpy(current_security, "WEP");
-        } else {
-            strcpy(current_security, "OPEN");
-        }
-
-        existing_idx = find_network_by_ssid(networks, network_count, current_ssid);
-        if (existing_idx >= 0) {
-            if (current_signal > networks[existing_idx].signal) {
-                networks[existing_idx].signal = current_signal;
-                strcpy(networks[existing_idx].security, current_security);
-            }
-        } else if (network_count < 50) {
-            strcpy(networks[network_count].ssid, current_ssid);
-            networks[network_count].signal = current_signal;
-            strcpy(networks[network_count].security, current_security);
-            network_count++;
-        }
-    }
-
-    pclose(fp);
-
-    /* Format results as Improv format: "SSID|security|strength\n" */
-    for (i = 0; i < network_count; i++) {
-        char entry[256];
-        int len = snprintf(entry, sizeof(entry), "%s|%s|%d\n",
-                          networks[i].ssid,
-                          networks[i].security,
-                          networks[i].signal);
-
-        if (result_len + len < result_size - 1) {
-            strcpy(result + result_len, entry);
-            result_len += len;
-        }
-    }
-
-    iot_printf("[IMPROV-SCAN] Found %d unique networks\n", network_count);
-    return result;
-}
+/* BLE device name and hostname (declared here for wifi_check_timer_cb access) */
+static char ble_device_name[64] = "Improv-Setup";
+static char device_hostname[64] = "thingino";
 
 /* Provision WiFi credentials */
 void provision_wifi_from_improv(const char* ssid, const char* password)
@@ -266,15 +102,119 @@ void provision_wifi_from_improv(const char* ssid, const char* password)
         iot_printf("[WIFI] Warning: fw_setenv wlan_pass failed: %d\n", rc);
     }
 
+    snprintf(cmd, sizeof(cmd), "wlan_ssid=\"%s\" wlan_pass=\"%s\" /etc/init.d/S38wpa_supplicant start 2>/dev/null",
+             ssid, password ? password : "");
+    rc = system(cmd);
+    if (rc != 0) {
+        iot_printf("[WIFI] Warning: /etc/init.d/S38wpa_supplicant start failed: %d\n", rc);
+    }
+
     /* Trigger WiFi connection */
     iot_printf("[WIFI] Triggering WiFi restart...\n");
-    rc = system("/sbin/wifi restart 2>/dev/null &");
+    rc = system("/etc/init.d/S40network restart 2>/dev/null &");
     if (rc == 0) {
-        wifi_status = 2;  /* Connected - assume success for now */
         iot_printf("[WIFI] WiFi restart triggered\n");
+
+        /* Start checking WiFi status after 3 seconds (give WiFi time to start) */
+        wifi_check_attempts = 0;
+        ble_npl_callout_reset(&wifi_check_timer, 3000);  /* 3000ms = 3 seconds */
+        iot_printf("[WIFI] WiFi status check scheduled\n");
     } else {
         wifi_status = 3;  /* Failed */
         iot_printf("[WIFI] WiFi restart failed\n");
+
+        /* Set error state immediately */
+        set_state(IMPROV_STATE_AUTHORIZED);
+        set_error(IMPROV_ERROR_UNABLE_TO_CONNECT);
+    }
+}
+
+/* Check if WiFi has an IP address */
+static int check_wifi_connected(void)
+{
+    FILE *fp;
+    char line[256];
+    int has_ip = 0;
+
+    /* Check if wlan0 has an IP address */
+    fp = popen("ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}'", "r");
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) {
+            /* Found an IP address */
+            if (strlen(line) > 3) {  /* At least "x.x\n" */
+                has_ip = 1;
+                iot_printf("[WIFI] WiFi connected with IP: %s", line);  /* line already has \n */
+            }
+        }
+        pclose(fp);
+    }
+
+    return has_ip;
+}
+
+/* Shutdown timer callback - reboot device after provisioning */
+static void shutdown_timer_cb(struct ble_npl_event *ev)
+{
+    (void)ev;
+
+    iot_printf("[IMPROV] ========================================\n");
+    iot_printf("[IMPROV] *** PROVISIONING COMPLETE - REBOOTING DEVICE ***\n");
+    iot_printf("[IMPROV] ========================================\n");
+
+    /* Reboot the device to apply new WiFi configuration */
+    iot_printf("[IMPROV] Rebooting in 1 second...\n");
+    sync();  /* Flush filesystem buffers */
+    system("sleep 1 && reboot &");
+
+    iot_printf("[IMPROV] Reboot initiated\n");
+}
+
+/* Timer callback to check WiFi status */
+static void wifi_check_timer_cb(struct ble_npl_event *ev)
+{
+    (void)ev;
+
+    wifi_check_attempts++;
+    iot_printf("[WIFI] Checking WiFi status (attempt %d/%d)...\n",
+               wifi_check_attempts, MAX_WIFI_CHECK_ATTEMPTS);
+
+    if (check_wifi_connected()) {
+        /* WiFi connected successfully */
+        wifi_status = 2;  /* Connected */
+        wifi_check_attempts = 0;
+
+        iot_printf("[WIFI] WiFi provisioning successful!\n");
+
+        /* Transition to PROVISIONED state and send redirect URL */
+        set_state(IMPROV_STATE_PROVISIONED);
+        set_error(IMPROV_ERROR_NONE);
+
+        /* Send redirect URL using actual hostname */
+        static char result_url[128];
+        snprintf(result_url, sizeof(result_url), "http://%s.local", device_hostname);
+        const char *url_ptr = result_url;
+        send_rpc_result(IMPROV_COMMAND_WIFI_SETTINGS, &url_ptr, 1);
+
+        iot_printf("[WIFI] Sent redirect URL: %s\n", result_url);
+
+        /* Schedule BLE shutdown after 2 seconds to allow notification delivery */
+        iot_printf("[WIFI] Scheduling BLE shutdown in 2 seconds...\n");
+        ble_npl_callout_reset(&shutdown_timer, 2000);  /* 2000ms = 2 seconds */
+
+    } else if (wifi_check_attempts >= MAX_WIFI_CHECK_ATTEMPTS) {
+        /* Timeout - WiFi failed to connect */
+        wifi_status = 3;  /* Failed */
+        wifi_check_attempts = 0;
+
+        iot_printf("[WIFI] WiFi provisioning failed - timeout\n");
+
+        /* Set error state */
+        set_state(IMPROV_STATE_AUTHORIZED);  /* Back to authorized */
+        set_error(IMPROV_ERROR_UNABLE_TO_CONNECT);
+
+    } else {
+        /* Keep checking - schedule next check in 1 second */
+        ble_npl_callout_reset(&wifi_check_timer, 1000);  /* 1000ms = 1 second */
     }
 }
 
@@ -396,7 +336,7 @@ static improv_state_t current_state = IMPROV_STATE_AUTHORIZED;  /* Auto-authoriz
 static improv_error_t current_error = IMPROV_ERROR_NONE;
 static uint8_t *rpc_result_data = NULL;
 static size_t rpc_result_data_len = 0;
-static uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
+/* conn_handle is now declared at the top of the file (line 88) */
 static uint8_t own_addr_type = BLE_OWN_ADDR_PUBLIC;
 
 /* Notification handles */
@@ -409,9 +349,7 @@ static const char* device_name = "Thingino";
 static const char* firmware_version = "1.0.0";
 static const char* hardware_version = "T31";
 
-/* BLE advertising name (hostname + "-setup") */
-static char ble_device_name[64] = "Improv-Setup";  /* Default fallback */
-static char device_hostname[64] = "thingino";      /* Hostname for redirect URL */
+/* BLE advertising name (hostname + "-setup") - declared at top of file */
 
 /*******************************************************************************
  * Helper Functions
@@ -596,61 +534,11 @@ static void handle_identify(void)
 
 static void handle_scan_wifi(void)
 {
-    iot_printf("[IMPROV] Scan WiFi command received\n");
+    iot_printf("[IMPROV] Scan WiFi command received - NOT SUPPORTED\n");
+    iot_printf("[IMPROV] WiFi scanning disabled (not functional in AP mode)\n");
 
-    /* Call WiFi scan function from thingino_gatt_server */
-    /* This should return Improv-formatted scan results */
-    char* scan_results = scan_wifi_networks_improv();
-
-    if (scan_results == NULL) {
-        iot_printf("[IMPROV] WiFi scan failed\n");
-        set_error(IMPROV_ERROR_UNKNOWN);
-        send_rpc_result(IMPROV_COMMAND_SCAN_WIFI, NULL, 0);
-        return;
-    }
-
-    /* Parse scan results into array of strings */
-    /* Format: "SSID1|WPA2|-45\nSSID2|OPEN|-67\n..." */
-
-    /* First, count lines */
-    size_t line_count = 0;
-    char *scan_copy = strdup(scan_results);
-    if (scan_copy == NULL) {
-        free(scan_results);
-        return;
-    }
-
-    char *line = strtok(scan_copy, "\n");
-    while (line != NULL) {
-        if (strlen(line) > 0) {
-            line_count++;
-        }
-        line = strtok(NULL, "\n");
-    }
-    free(scan_copy);
-
-    /* Allocate string array */
-    const char **networks = (const char **)malloc(line_count * sizeof(char*));
-    if (networks == NULL) {
-        free(scan_results);
-        return;
-    }
-
-    /* Parse again and store pointers */
-    size_t idx = 0;
-    line = strtok(scan_results, "\n");
-    while (line != NULL && idx < line_count) {
-        if (strlen(line) > 0) {
-            networks[idx++] = line;
-        }
-        line = strtok(NULL, "\n");
-    }
-
-    iot_printf("[IMPROV] Found %zu networks\n", line_count);
-    send_rpc_result(IMPROV_COMMAND_SCAN_WIFI, networks, line_count);
-
-    free(networks);
-    free(scan_results);
+    /* Return empty result - scanning not supported */
+    send_rpc_result(IMPROV_COMMAND_SCAN_WIFI, NULL, 0);
 }
 
 static void handle_get_device_info(void)
@@ -1031,6 +919,16 @@ void improv_gatt_service_init(void)
     current_state = IMPROV_STATE_AUTHORIZED;  /* Auto-authorize */
     current_error = IMPROV_ERROR_NONE;
 
+    /* Initialize WiFi check timer */
+    ble_npl_callout_init(&wifi_check_timer, nimble_port_get_dflt_eventq(),
+                         wifi_check_timer_cb, NULL);
+    iot_printf("[IMPROV] WiFi check timer initialized\n");
+
+    /* Initialize shutdown timer */
+    ble_npl_callout_init(&shutdown_timer, nimble_port_get_dflt_eventq(),
+                         shutdown_timer_cb, NULL);
+    iot_printf("[IMPROV] Shutdown timer initialized\n");
+
     /* Register GATT service */
     rc = ble_gatts_count_cfg(improv_gatt_services);
     if (rc != 0) {
@@ -1063,8 +961,27 @@ static int improv_gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         iot_printf("[IMPROV] GAP Connect event: status=%d\n", event->connect.status);
         if (event->connect.status == 0) {
+            struct ble_gap_upd_params params;
+            int rc;
+
             conn_handle = event->connect.conn_handle;
             iot_printf("[IMPROV] Connected: handle=%d\n", conn_handle);
+
+            /* Update connection parameters to prevent timeout */
+            memset(&params, 0, sizeof(params));
+            params.itvl_min = 24;   /* 30ms (units of 1.25ms) */
+            params.itvl_max = 40;   /* 50ms */
+            params.latency = 0;     /* No slave latency */
+            params.supervision_timeout = 3200;  /* 32 seconds (units of 10ms) */
+            params.min_ce_len = 0;
+            params.max_ce_len = 0;
+
+            rc = ble_gap_update_params(conn_handle, &params);
+            if (rc != 0) {
+                iot_printf("[IMPROV] WARNING: Failed to update connection params: %d\n", rc);
+            } else {
+                iot_printf("[IMPROV] Connection parameters updated (supervision timeout: 32s)\n");
+            }
         } else {
             /* Connection failed, resume advertising */
             iot_printf("[IMPROV] Connection failed, restarting advertising\n");
@@ -1085,6 +1002,25 @@ static int improv_gap_event_cb(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_SUBSCRIBE:
         iot_printf("[IMPROV] GAP Subscribe event: handle=%d\n", event->subscribe.attr_handle);
+        break;
+
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        iot_printf("[IMPROV] Connection parameters updated: status=%d\n", event->conn_update.status);
+        if (event->conn_update.status == 0) {
+            struct ble_gap_conn_desc desc;
+            int rc = ble_gap_conn_find(event->conn_update.conn_handle, &desc);
+            if (rc == 0) {
+                iot_printf("[IMPROV] - Interval: %dms, Latency: %d, Timeout: %dms\n",
+                           (int)(desc.conn_itvl * 1.25),
+                           desc.conn_latency,
+                           desc.supervision_timeout * 10);
+            }
+        }
+        break;
+
+    case BLE_GAP_EVENT_MTU:
+        iot_printf("[IMPROV] MTU updated: conn_handle=%d, mtu=%d\n",
+                   event->mtu.conn_handle, event->mtu.value);
         break;
 
     default:

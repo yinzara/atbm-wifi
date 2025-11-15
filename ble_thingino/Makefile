@@ -32,7 +32,11 @@ SRC := \
 	$(SRC_DIR)/ble.c \
 	$(SRC_DIR)/cli_stubs.c \
 	$(SRC_DIR)/improv/improv.c \
-	$(SRC_DIR)/improv_gatt_service.c
+	$(SRC_DIR)/improv_gatt_service.c \
+	$(SRC_DIR)/os/os_atomic.c \
+	$(SRC_DIR)/os/os_mutex.c \
+	$(SRC_DIR)/os/os_eventq.c \
+	$(SRC_DIR)/os/os_task.c
 
 # Include NimBLE host components (minimal set for Improv WiFi)
 include $(NIMBLE_ROOT)/Makefile_host.include
@@ -43,11 +47,17 @@ NIMBLE_IGNORE := \
 	$(NIMBLE_ROOT)/porting/nimble/src/os_cputime.c \
 	$(NIMBLE_ROOT)/porting/nimble/src/os_cputime_pwr2.c
 
-# Add OS layer sources from ble_host
+# Add OS layer sources from ble_host (excluding ones we've fixed for musl compatibility)
 # Note: Transport layer is provided by Makefile_host.include (ioctl for CONFIG_LINUX_BLE_STACK_APP=y)
-SRC += \
-	$(wildcard $(BLE_HOST_ROOT)/os/linux_app/src/*.c) \
-	$(wildcard $(BLE_HOST_ROOT)/os/linux_app/src/*.cc)
+# We manually select which OS files to include, excluding musl-incompatible ones
+OS_SRC := \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_callout.c \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_sem.c \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_time.c
+
+# Explicitly exclude problematic OS files (we provide musl-compatible versions in src/os/)
+# os_atomic.c, os_mutex.c, os_eventq.c, os_task.c - replaced with musl-compatible versions
+SRC += $(OS_SRC)
 
 # Include paths
 INC := \
@@ -69,13 +79,26 @@ OBJ := $(SRC_C:.c=.o)
 OBJ += $(SRC_CC:.cc=.o)
 
 # Filter out conflicting files from LIB_NIMBLE_SRC that we've replaced
-# We replace: main.o, ble.o, cli.o, ble_at_cmd.o, and btshell
+# We replace: main, ble, cli, ble_at_cmd, btshell, and OS layer files
+# Filter both .c and .o extensions since LIB_NIMBLE_SRC may contain either
 NIMBLE_OBJ_FILTERED := $(filter-out \
+	$(NIMBLE_ROOT)/apps/main.c \
 	$(NIMBLE_ROOT)/apps/main.o \
+	$(NIMBLE_ROOT)/apps/ble.c \
 	$(NIMBLE_ROOT)/apps/ble.o \
+	$(NIMBLE_ROOT)/cli/cli.c \
 	$(NIMBLE_ROOT)/cli/cli.o \
+	$(NIMBLE_ROOT)/cli/ble_at_cmd.c \
 	$(NIMBLE_ROOT)/cli/ble_at_cmd.o \
 	$(NIMBLE_ROOT)/apps/btshell/% \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_atomic.c \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_atomic.o \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_mutex.c \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_mutex.o \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_eventq.c \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_eventq.o \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_task.c \
+	$(BLE_HOST_ROOT)/os/linux_app/src/os_task.o \
 	,$(LIB_NIMBLE_SRC))
 
 OBJ += $(NIMBLE_OBJ_FILTERED)
@@ -88,10 +111,15 @@ CFLAGS := \
 	$(INCLUDES) \
 	-g \
 	-D_GNU_SOURCE \
+	-D__WORDSIZE=32 \
 	-Os \
 	-fPIC \
 	-DCONFIG_LINUX_BLE_STACK_APP=1 \
-	-DCONFIG_BLE_PTS_TEST_MOD=0
+	-DCONFIG_BLE_PTS_TEST_MOD=0 \
+	-Wno-return-mismatch \
+	-include stdlib.h \
+	-include sys/ioctl.h \
+	-include $(SRC_DIR)/os/os_npl_extensions.h
 
 # Linker flags
 LDFLAGS := -static

@@ -5,6 +5,7 @@
  * so these are stub implementations.
  */
 
+#include <stdio.h>
 #include "atbm_debug.h"
 
 /* Global variable stubs */
@@ -25,9 +26,11 @@ void atcmd_init_ble(void)
     iot_printf("[CLI] Improv WiFi mode - AT commands disabled\n");
 }
 
-void cli_set_event(void)
+void cli_set_event(const char *cmd_line, int len)
 {
     /* No-op - CLI events not used in Improv WiFi mode */
+    (void)cmd_line;
+    (void)len;
 }
 
 void ble_startup_indication(const void *data)
